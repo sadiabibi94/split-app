@@ -1,0 +1,611 @@
+import 'package:flutter/material.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import '../models/group_model.dart';
+import '../models/user_model.dart';
+import 'dart:async';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'dart:convert';
+import '../services/notification_listener_service.dart';
+
+class GroupProvider extends ChangeNotifier {
+  final FirebaseFirestore _firestore = FirebaseFirestore.instance;
+  bool _isLoading = false;
+  String? _error;
+  List<GroupModel> _groups = [];
+  final _loadingController = StreamController<bool>.broadcast();
+
+  bool get isLoading => _isLoading;
+  String? get error => _error;
+  List<GroupModel> get groups => _groups;
+  Stream<bool> get loadingStream => _loadingController.stream;
+
+  @override
+  void dispose() {
+    _loadingController.close();
+    super.dispose();
+  }
+
+  // Returns a stream of groups where the user is a member (faster, scalable)
+  Stream<List<GroupModel>> getUserGroupsStream(String userId) {
+    return _firestore
+        .collection('groups')
+        .where('memberIds', arrayContains: userId)
+        .snapshots()
+        .map((snapshot) {
+      final groups =
+          snapshot.docs.map((doc) => GroupModel.fromFirestore(doc)).toList();
+      saveGroupsToPrefs(groups); // cache after fetch
+      return groups;
+    });
+  }
+
+  Future<void> createGroup(String name, UserModel creator,
+      {String? photoUrl,
+      required String? description,
+      double? initialAmount}) async {
+    try {
+      _setLoading(true);
+      _error = null;
+
+      // Create group document with memberIds array for fast lookup
+      final groupRef = await _firestore.collection('groups').add({
+        'name': name,
+        'createdBy': creator.uid,
+        'createdAt': FieldValue.serverTimestamp(),
+        'members': [
+          {
+            'userId': creator.uid,
+            'username': creator.username,
+            'email': creator.email,
+            'isAdmin': true,
+            'joinedAt': Timestamp.fromDate(DateTime.now()),
+          }
+        ],
+        'memberIds': [creator.uid],
+        if (photoUrl != null) 'photoUrl': photoUrl,
+        if (description != null) 'description': description,
+        if (initialAmount != null) 'initialAmount': initialAmount,
+      });
+
+      // Add group to creator's groups list
+      await _firestore.collection('users').doc(creator.uid).update({
+        'groupIds': FieldValue.arrayUnion([groupRef.id]),
+      });
+
+      _setLoading(false);
+    } catch (e) {
+      _setLoading(false);
+      _error = 'Failed to create group: $e';
+      notifyListeners();
+    }
+  }
+
+  Future<void> loadUserGroups(String userId) async {
+    try {
+      _setLoading(true);
+      _error = null;
+
+      // Get user's group IDs
+      final userDoc = await _firestore.collection('users').doc(userId).get();
+      final userData = userDoc.data();
+      final groupIds = List<String>.from(userData?['groupIds'] ?? []);
+
+      // Load group details
+      _groups = [];
+      for (String groupId in groupIds) {
+        final groupDoc =
+            await _firestore.collection('groups').doc(groupId).get();
+        if (groupDoc.exists) {
+          _groups.add(GroupModel.fromFirestore(groupDoc));
+        }
+      }
+
+      _setLoading(false);
+    } catch (e) {
+      _setLoading(false);
+      _error = 'Failed to load groups: $e';
+      notifyListeners();
+    }
+  }
+
+  Future<void> inviteUserToGroup({
+    required String groupId,
+    required String invitedBy,
+    required String invitedByUsername,
+    required String invitedByEmail,
+    required String invitedUserEmail,
+  }) async {
+    try {
+      _setLoading(true);
+      _error = null;
+
+      // Check if user exists
+      final userQuery = await _firestore
+          .collection('users')
+          .where('email', isEqualTo: invitedUserEmail)
+          .get();
+
+      if (userQuery.docs.isEmpty) {
+        throw 'User not found';
+      }
+
+      final invitedUser = userQuery.docs.first;
+      final invitedUserId = invitedUser.id;
+
+      // Check if user is already a member
+      final groupDoc = await _firestore.collection('groups').doc(groupId).get();
+      final group = GroupModel.fromFirestore(groupDoc);
+
+      if (group.members.any((member) => member.userId == invitedUserId)) {
+        throw 'User is already a member of this group';
+      }
+
+      // Create invitation
+      await _firestore.collection('group_invitations').add({
+        'groupId': groupId,
+        'groupName': group.name,
+        'invitedBy': invitedBy,
+        'invitedByUsername': invitedByUsername,
+        'invitedByEmail': invitedByEmail,
+        'invitedUserId': invitedUserId,
+        'invitedUserEmail': invitedUserEmail,
+        'invitedUserName': invitedUser['username'] ?? '',
+        'status': 'pending',
+        'createdAt': FieldValue.serverTimestamp(),
+      });
+
+      // Note: Local notifications are handled automatically by NotificationListenerService
+      // which only notifies the invited user (not the inviter)
+
+      // Add invitation to user's invitations list (this is handled by the invitation itself, no need for invitationIds array in user doc)
+      // The user will see invitations in their InvitationsScreen by querying the group_invitations collection.
+      // If you still want to track invitation IDs on the user document, ensure they are also updated when invitations are accepted/rejected
+
+      _setLoading(false);
+    } catch (e) {
+      _setLoading(false);
+      _error = 'Failed to invite user: $e';
+      notifyListeners();
+    }
+  }
+
+  void _setLoading(bool value) {
+    _isLoading = value;
+    _loadingController.add(value);
+    notifyListeners();
+  }
+
+  Future<void> acceptInvitation({
+    required String invitationId,
+    required String groupId,
+    required UserModel user,
+  }) async {
+    try {
+      _isLoading = true;
+      _error = null;
+      notifyListeners();
+
+      // Add user to group members
+      await _firestore.collection('groups').doc(groupId).update({
+        'members': FieldValue.arrayUnion([
+          {
+            'userId': user.uid,
+            'username': user.username,
+            'email': user.email,
+            'isAdmin': false,
+            'joinedAt': Timestamp.fromDate(DateTime.now()),
+          }
+        ]),
+        'memberIds': FieldValue.arrayUnion([user.uid]),
+      });
+
+      // Add group to user's groups list
+      await _firestore.collection('users').doc(user.uid).update({
+        'groupIds': FieldValue.arrayUnion([groupId]),
+        // 'invitationIds': FieldValue.arrayRemove([groupId]), // Remove if not explicitly used
+      });
+
+      // Update invitation status
+      await _firestore
+          .collection('group_invitations')
+          .doc(invitationId)
+          .update({
+        'status': 'accepted',
+        'acceptedAt': FieldValue.serverTimestamp(),
+      });
+
+      // Refresh notification listeners to include new group
+      await NotificationListenerService().refreshUserGroups();
+
+      _isLoading = false;
+      notifyListeners();
+    } catch (e) {
+      _isLoading = false;
+      _error = 'Failed to accept invitation: $e';
+      notifyListeners();
+    }
+  }
+
+  Future<void> rejectInvitation({
+    required String invitationId,
+    required String groupId,
+    required String userId,
+  }) async {
+    try {
+      _isLoading = true;
+      _error = null;
+      notifyListeners();
+
+      // Remove invitation from user's invitations list (if this array is still used)
+      // await _firestore.collection('users').doc(userId).update({
+      //   'invitationIds': FieldValue.arrayRemove([groupId]),
+      // });
+
+      // Update invitation status
+      await _firestore
+          .collection('group_invitations')
+          .doc(invitationId)
+          .update({
+        'status': 'rejected',
+        'rejectedAt': FieldValue.serverTimestamp(),
+      });
+
+      _isLoading = false;
+      notifyListeners();
+    } catch (e) {
+      _isLoading = false;
+      _error = 'Failed to reject invitation: $e';
+      notifyListeners();
+    }
+  }
+
+  Future<void> removeMember({
+    required String groupId,
+    required String userId,
+    required String removedBy,
+  }) async {
+    try {
+      _isLoading = true;
+      _error = null;
+      notifyListeners();
+
+      // Get group data
+      final groupDoc = await _firestore.collection('groups').doc(groupId).get();
+      final group = GroupModel.fromFirestore(groupDoc);
+
+      // Check if remover is admin
+      final remover = group.members.firstWhere(
+        (member) => member.userId == removedBy,
+        orElse: () => throw 'You are not a member of this group',
+      );
+
+      if (!remover.isAdmin) {
+        throw 'Only group admins can remove members';
+      }
+
+      // Remove member from group
+      final memberToRemove = group.members.firstWhere(
+        (member) => member.userId == userId,
+        orElse: () => throw 'Member not found in group',
+      );
+
+      await _firestore.collection('groups').doc(groupId).update({
+        'members': FieldValue.arrayRemove([memberToRemove.toMap()]),
+        'memberIds': FieldValue.arrayRemove([userId]),
+      });
+
+      // Remove group from user's groups list
+      await _firestore.collection('users').doc(userId).update({
+        'groupIds': FieldValue.arrayRemove([groupId]),
+      });
+
+      // Refresh notification listeners
+      await NotificationListenerService().refreshUserGroups();
+
+      _isLoading = false;
+      notifyListeners();
+    } catch (e) {
+      _isLoading = false;
+      _error = 'Failed to remove member: $e';
+      notifyListeners();
+    }
+  }
+
+  Future<void> addExpense({
+    required String groupId,
+    required String description,
+    required double amount,
+    required String paidBy,
+    required DateTime expenseDate,
+    String? notes,
+    List<String>? splitAmong,
+    Map<String, double>? customSplitAmounts,
+  }) async {
+    try {
+      _isLoading = true;
+      _error = null;
+      notifyListeners();
+
+      // Determine split type and data to store
+      String splitType;
+      dynamic splitData;
+
+      if (customSplitAmounts != null && customSplitAmounts.isNotEmpty) {
+        splitType = 'custom';
+        splitData = customSplitAmounts;
+      } else if (splitAmong != null && splitAmong.isNotEmpty) {
+        splitType = 'equal';
+        splitData = splitAmong;
+      } else {
+        throw 'Invalid split configuration. Must have splitAmong or customSplitAmounts.';
+      }
+
+      await _firestore
+          .collection('groups')
+          .doc(groupId)
+          .collection('expenses')
+          .add({
+        'description': description,
+        'amount': amount,
+        'paidBy': paidBy,
+        'expenseDate': Timestamp.fromDate(expenseDate),
+        'notes': notes,
+        'splitType': splitType,
+        'splitData': splitData,
+        'timestamp': FieldValue.serverTimestamp(),
+      });
+
+      // After adding the expense, update the expense count on the group
+      await _firestore.collection('groups').doc(groupId).update({
+        'expenseCount': FieldValue.increment(1),
+      });
+
+      // Create Firestore notification documents for all members
+      // (Local notifications will be handled automatically by NotificationListenerService
+      // which filters out notifications for own actions)
+      final groupDoc = await _firestore.collection('groups').doc(groupId).get();
+      final groupName = groupDoc.data()?['name'] ?? 'Group';
+      final memberIds = List<String>.from(groupDoc.data()?['memberIds'] ?? []);
+
+      for (final userId in memberIds) {
+        // Create Firestore notification document
+        await _firestore.collection('group_expense_notifications').add({
+          'userId': userId,
+          'groupId': groupId,
+          'groupName': groupName,
+          'expenseTitle': description,
+          'amount': amount,
+          'action': 'added',
+          'timestamp': FieldValue.serverTimestamp(),
+        });
+      }
+
+      _isLoading = false;
+      notifyListeners();
+    } catch (e) {
+      _isLoading = false;
+      _error = 'Failed to add expense: \$e';
+      notifyListeners();
+    }
+  }
+
+  Future<Map<String, double>> calculateGroupBalances(
+      String groupId, List<GroupMember> groupMembers) async {
+    Map<String, double> balances = {};
+
+    // Initialize balances for all group members to 0
+    for (var member in groupMembers) {
+      balances[member.userId] = 0.0;
+    }
+
+    final expenseSnapshot = await _firestore
+        .collection('groups')
+        .doc(groupId)
+        .collection('expenses')
+        .get();
+
+    for (var doc in expenseSnapshot.docs) {
+      final data = doc.data();
+      final String paidBy = data['paidBy'];
+      final double amount = (data['amount'] as num).toDouble();
+      final String splitType =
+          data['splitType'] ?? 'equal'; // Default to 'equal'
+
+      // Add the full amount to the person who paid
+      balances[paidBy] = (balances[paidBy] ?? 0.0) + amount;
+
+      if (splitType == 'equal') {
+        final List<dynamic> splitAmong = data['splitAmong'] ?? [];
+        if (splitAmong.isNotEmpty) {
+          final double share = amount / splitAmong.length;
+          for (var memberId in splitAmong) {
+            balances[memberId.toString()] =
+                (balances[memberId.toString()] ?? 0.0) - share;
+          }
+        }
+      } else if (splitType == 'custom') {
+        final Map<String, dynamic> customSplitAmounts =
+            data['customSplitAmounts'] ?? {};
+        customSplitAmounts.forEach((userId, customAmount) {
+          balances[userId] =
+              (balances[userId] ?? 0.0) - (customAmount as num).toDouble();
+        });
+      }
+    }
+
+    return balances;
+  }
+
+  Future<void> deleteGroup(String groupId, String userId) async {
+    try {
+      _setLoading(true);
+      _error = null;
+
+      // Get group data
+      final groupDoc = await _firestore.collection('groups').doc(groupId).get();
+      final group = GroupModel.fromFirestore(groupDoc);
+
+      // Check if user is admin
+      final user = group.members.firstWhere(
+        (member) => member.userId == userId,
+        orElse: () => throw 'You are not a member of this group',
+      );
+
+      if (!user.isAdmin) {
+        throw 'Only group admins can delete the group';
+      }
+
+      // Delete all expenses
+      final expensesSnapshot = await _firestore
+          .collection('groups')
+          .doc(groupId)
+          .collection('expenses')
+          .get();
+
+      for (var doc in expensesSnapshot.docs) {
+        await doc.reference.delete();
+      }
+
+      // Remove group from all members' groupIds
+      for (var member in group.members) {
+        await _firestore.collection('users').doc(member.userId).update({
+          'groupIds': FieldValue.arrayRemove([groupId]),
+        });
+      }
+
+      // Delete the group document
+      await _firestore.collection('groups').doc(groupId).delete();
+
+      _setLoading(false);
+    } catch (e) {
+      _setLoading(false);
+      _error = 'Failed to delete group: $e';
+      notifyListeners();
+    }
+  }
+
+  bool isUserAdmin(String userId, List<GroupMember> members) {
+    return members.any((member) => member.userId == userId && member.isAdmin);
+  }
+
+  Future<List<GroupModel>> fetchUserGroupsPage(String userId,
+      {DocumentSnapshot? startAfter, int limit = 10}) async {
+    Query query = _firestore
+        .collection('groups')
+        .where('memberIds', arrayContains: userId)
+        .orderBy('createdAt', descending: true)
+        .limit(limit);
+
+    if (startAfter != null) {
+      query = query.startAfterDocument(startAfter);
+    }
+
+    final snapshot = await query.get();
+    return snapshot.docs.map((doc) => GroupModel.fromFirestore(doc)).toList();
+  }
+
+  // Returns a stream of all groups (for admin or discovery purposes)
+  Stream<List<GroupModel>> getAllGroupsStream() {
+    return _firestore.collection('groups').snapshots().map((snapshot) =>
+        snapshot.docs.map((doc) => GroupModel.fromFirestore(doc)).toList());
+  }
+
+  // Save groups to shared preferences
+  Future<void> saveGroupsToPrefs(List<GroupModel> groups) async {
+    final prefs = await SharedPreferences.getInstance();
+    final groupsJson = jsonEncode(groups.map((g) => g.toJson()).toList());
+    await prefs.setString('userGroups', groupsJson);
+  }
+
+  // Load groups from shared preferences
+  Future<List<GroupModel>> loadGroupsFromPrefs() async {
+    final prefs = await SharedPreferences.getInstance();
+    final groupsJson = prefs.getString('userGroups');
+    if (groupsJson == null) return [];
+    final List decoded = jsonDecode(groupsJson);
+    return decoded.map((g) => GroupModel.fromJson(g)).toList();
+  }
+
+  // One-time fetch for user groups (for FutureBuilder)
+  Future<List<GroupModel>> getUserGroupsOnce(String userId) async {
+    final snapshot = await _firestore
+        .collection('groups')
+        .where('memberIds', arrayContains: userId)
+        .get();
+    final groups =
+        snapshot.docs.map((doc) => GroupModel.fromFirestore(doc)).toList();
+    await saveGroupsToPrefs(groups); // cache after fetch
+    return groups;
+  }
+
+  Future<void> updateExpense({
+    required String groupId,
+    required String expenseId,
+    required String description,
+    required double amount,
+    required String paidBy,
+    required DateTime expenseDate,
+    String? notes,
+    List<String>? splitAmong,
+    Map<String, double>? customSplitAmounts,
+  }) async {
+    try {
+      _isLoading = true;
+      _error = null;
+      notifyListeners();
+
+      // Determine split type and data to store
+      String splitType;
+      dynamic splitData;
+
+      if (customSplitAmounts != null && customSplitAmounts.isNotEmpty) {
+        splitType = 'custom';
+        splitData = customSplitAmounts;
+      } else if (splitAmong != null && splitAmong.isNotEmpty) {
+        splitType = 'equal';
+        splitData = splitAmong;
+      } else {
+        throw 'Invalid split configuration. Must have splitAmong or customSplitAmounts.';
+      }
+
+      await _firestore
+          .collection('groups')
+          .doc(groupId)
+          .collection('expenses')
+          .doc(expenseId)
+          .update({
+        'description': description,
+        'amount': amount,
+        'paidBy': paidBy,
+        'expenseDate': Timestamp.fromDate(expenseDate),
+        'notes': notes,
+        'splitType': splitType,
+        'splitData': splitData,
+        'updatedAt': FieldValue.serverTimestamp(),
+      });
+
+      // Send group expense notification to all members
+      final groupDoc = await _firestore.collection('groups').doc(groupId).get();
+      final groupName = groupDoc.data()?['name'] ?? 'Group';
+      final memberIds = List<String>.from(groupDoc.data()?['memberIds'] ?? []);
+      for (final userId in memberIds) {
+        await _firestore.collection('group_expense_notifications').add({
+          'userId': userId,
+          'groupId': groupId,
+          'groupName': groupName,
+          'expenseTitle': description,
+          'amount': amount,
+          'action': 'edited',
+          'timestamp': FieldValue.serverTimestamp(),
+        });
+      }
+
+      _isLoading = false;
+      notifyListeners();
+    } catch (e) {
+      _isLoading = false;
+      _error = 'Failed to update expense: $e';
+      notifyListeners();
+    }
+  }
+}
